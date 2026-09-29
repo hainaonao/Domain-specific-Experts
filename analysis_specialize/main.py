@@ -287,7 +287,8 @@ def load_model_and_tokenizer(model_name: str, device: str = "auto"):
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     model_kwargs = {
-        "torch_dtype": torch.float16 if device == "cuda" else torch.float32,
+        "torch_dtype": torch.bfloat16 if device == "cuda" else torch.float32,
+        "attn_implementation": "sdpa",
         "trust_remote_code": True,
     }
     if device == "cuda":
