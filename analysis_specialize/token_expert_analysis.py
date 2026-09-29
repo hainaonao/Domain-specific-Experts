@@ -351,8 +351,9 @@ def capture_expert_activations(
         layers = model.transformer.h
 
     if layers is not None:
-        # Common MoE layer attribute names across different models
-        moe_layer_attrs = ['mlp', 'block_sparse_moe', 'moe', 'feed_forward']
+        # Common MoE layer attribute names across different models.
+        # Check explicit MoE attributes first; mlp last (it may be dense).
+        moe_layer_attrs = ['block_sparse_moe', 'moe', 'feed_forward', 'mlp']
 
         for layer_idx, layer in enumerate(layers):
             moe_module = None

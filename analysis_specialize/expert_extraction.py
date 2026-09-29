@@ -41,8 +41,10 @@ except ImportError:
 # MoE Structure Detection
 # =============================================================================
 
-# Attribute names used across popular MoE architectures
-_MOE_LAYER_ATTRS = ("mlp", "block_sparse_moe", "moe", "feed_forward")
+# Attribute names used across popular MoE architectures.
+# Order matters: check explicit MoE attributes first, fall back to ``mlp``
+# last since ``mlp`` may or may not be MoE depending on the model.
+_MOE_LAYER_ATTRS = ("block_sparse_moe", "moe", "feed_forward", "mlp")
 _ROUTER_ATTRS = ("gate", "router", "gating_network")
 _EXPERT_LIST_ATTRS = ("experts", "local_experts", "mlp_experts")
 
