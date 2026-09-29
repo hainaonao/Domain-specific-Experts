@@ -1,0 +1,38 @@
+# Expert extraction configuration.
+#
+# Prerequisites: run analysis_specialize.main first to produce expert score
+# files, then point expert_scores_path to that output directory.
+
+model_name: "microsoft/Phi-tiny-MoE-instruct"
+device: "auto"
+
+# Expert scores (from main.py output)
+expert_scores_path: "output/sample_run"
+target_domain: "mathematics"
+
+# Extraction settings
+extraction_mode: "dense"
+top_k_experts_per_layer: 1  # 1 = best expert per layer → dense model
+
+# Validation
+validate: true
+test_prompts:
+  - "What is 2 + 2?"
+  - "Solve for x: 3x + 5 = 20"
+  - "The derivative of x^2 is"
+
+# Output
+output_dir: "output/extracted_models"
+
+# Finetuning (set finetune: true and provide train_data to enable)
+finetune: false
+train_data: null
+num_epochs: 3
+learning_rate: 2.0e-5
+batch_size: 4
+max_sequence_length: 512
+use_lora: true
+lora_rank: 16
+lora_alpha: 32
+
+verbose: true

@@ -34,6 +34,20 @@ from .domain_steering import (
     run_domain_steering,
     select_top_experts_from_scores,
 )
+from .expert_extraction import (
+    MoELayerInfo,
+    MoEStructure,
+    build_dense_model,
+    detect_moe_structure,
+    load_domain_scores,
+    save_extracted_model,
+    select_experts_by_score,
+    validate_extracted_model,
+)
+from .extract_and_finetune import (
+    ExtractionConfig,
+    run_extraction,
+)
 
 __all__ = [
     "analyze_domain_data",
@@ -59,4 +73,14 @@ __all__ = [
     "load_domain_examples",
     "run_domain_steering",
     "select_top_experts_from_scores",
+    "MoELayerInfo",
+    "MoEStructure",
+    "build_dense_model",
+    "detect_moe_structure",
+    "load_domain_scores",
+    "save_extracted_model",
+    "select_experts_by_score",
+    "validate_extracted_model",
+    "ExtractionConfig",
+    "run_extraction",
 ]
