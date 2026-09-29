@@ -120,7 +120,7 @@ def detect_moe_structure(model, model_name: str = "") -> MoEStructure:
     moe_layer_infos: List[MoELayerInfo] = []
 
     for layer_idx, layer in enumerate(layers):
-        # Find the MoE sub-module (e.g. layer.mlp)
+        # Find the MoE sub-module (e.g. layer.mlp, layer.block_sparse_moe)
         moe_module = None
         moe_attr = ""
         for attr in _MOE_LAYER_ATTRS:
@@ -151,14 +151,57 @@ def detect_moe_structure(model, model_name: str = "") -> MoEStructure:
                 expert_list_attr = attr
                 break
 
-        if expert_list is None:
-            continue
+        # Determine number of experts from the expert list.
+        # Support nn.ModuleList, nn.ModuleDict, or any sized container.
+        num_experts = 0
+        expert_names: List[str] = []
 
-        # Number of experts
-        if isinstance(expert_list, nn.ModuleList):
-            num_experts = len(expert_list)
-            expert_names = [f"{expert_list_attr}.{i}" for i in range(num_experts)]
-        else:
+        if expert_list is not None:
+            if isinstance(expert_list, nn.ModuleList):
+                num_experts = len(expert_list)
+                expert_names = [f"{expert_list_attr}.{i}" for i in range(num_experts)]
+            elif isinstance(expert_list, nn.ModuleDict):
+                num_experts = len(expert_list)
+                expert_names = [
+                    f"{expert_list_attr}.{k}" for k in expert_list.keys()
+                ]
+            elif isinstance(expert_list, nn.Module):
+                # Some implementations wrap experts in a custom Module;
+                # count its direct children as individual experts.
+                children = list(expert_list.children())
+                if children:
+                    num_experts = len(children)
+                    expert_names = [
+                        f"{expert_list_attr}.{i}" for i in range(num_experts)
+                    ]
+            elif hasattr(expert_list, "__len__"):
+                num_experts = len(expert_list)
+                expert_names = [
+                    f"{expert_list_attr}.{i}" for i in range(num_experts)
+                ]
+
+        if num_experts == 0:
+            # Fallback: try to infer num_experts from model config
+            model_config = getattr(model, "config", None)
+            if model_config is not None:
+                for cfg_attr in ("num_experts", "num_local_experts",
+                                 "n_experts", "moe_num_experts"):
+                    if hasattr(model_config, cfg_attr):
+                        num_experts = getattr(model_config, cfg_attr)
+                        expert_list_attr = expert_list_attr or "(from config)"
+                        expert_names = [
+                            f"expert.{i}" for i in range(num_experts)
+                        ]
+                        break
+
+        if num_experts == 0:
+            # Debug: show what we found so the user can diagnose
+            print(
+                f"  [!] Layer {layer_idx}: found MoE module "
+                f"(attr={moe_attr!r}, router={router_attr!r}) but could not "
+                f"determine expert count. Children: "
+                f"{[name for name, _ in moe_module.named_children()]}"
+            )
             continue
 
         moe_layer_infos.append(
@@ -334,22 +377,44 @@ def build_dense_model(
     for info in moe_structure.layers:
         layer = layers[info.layer_idx]
         moe_module = getattr(layer, info.moe_attr)
-        expert_list = getattr(moe_module, info.expert_list_attr)
+        expert_list = getattr(moe_module, info.expert_list_attr, None)
 
         # Get the selected expert index for this layer
         layer_selection = selected_experts.get(info.layer_idx, [(0, 0.0)])
         expert_idx, expert_score = layer_selection[0]
 
-        if expert_idx >= len(expert_list):
-            print(
-                f"  [!] Layer {info.layer_idx}: expert {expert_idx} out of range "
-                f"(max {len(expert_list) - 1}), using expert 0"
-            )
-            expert_idx = 0
-            expert_score = 0.0
+        # Extract the expert module from various container types
+        expert_module = None
 
-        # Extract the expert module
-        expert_module = expert_list[expert_idx]
+        if expert_list is not None:
+            if isinstance(expert_list, nn.ModuleList):
+                if expert_idx >= len(expert_list):
+                    print(
+                        f"  [!] Layer {info.layer_idx}: expert {expert_idx} "
+                        f"out of range (max {len(expert_list) - 1}), using 0"
+                    )
+                    expert_idx, expert_score = 0, 0.0
+                expert_module = expert_list[expert_idx]
+            elif isinstance(expert_list, nn.ModuleDict):
+                keys = list(expert_list.keys())
+                key = str(expert_idx) if str(expert_idx) in keys else keys[
+                    min(expert_idx, len(keys) - 1)
+                ]
+                expert_module = expert_list[key]
+            elif isinstance(expert_list, nn.Module):
+                children = list(expert_list.children())
+                if expert_idx >= len(children):
+                    expert_idx = 0
+                    expert_score = 0.0
+                if children:
+                    expert_module = children[expert_idx]
+
+        if expert_module is None:
+            print(
+                f"  [!] Layer {info.layer_idx}: could not extract expert "
+                f"{expert_idx}, skipping"
+            )
+            continue
 
         # Create dense wrapper
         dense_ffn = _DenseFFNWrapper(expert_module)
