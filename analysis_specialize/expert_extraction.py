@@ -509,7 +509,7 @@ def _extract_expert_from_fused(fused_module, expert_idx, num_experts):
 
     # Pattern 2: combined gate_up_proj
     gate_up_w = _get_expert_weight(fused_module, "gate_up_proj", expert_idx)
-    down_w = down_w or _get_expert_weight(fused_module, "down_proj", expert_idx)
+    down_w = down_w if down_w is not None else _get_expert_weight(fused_module, "down_proj", expert_idx)
 
     if gate_up_w is not None and down_w is not None:
         mid = gate_up_w.shape[0] // 2
