@@ -153,8 +153,13 @@ def detect_moe_structure(model, model_name: str = "") -> MoEStructure:
 
         # Determine number of experts from the expert list.
         # Support nn.ModuleList, nn.ModuleDict, or any sized container.
+        # Some models (e.g. OLMoE) wrap experts in a custom nn.Module;
+        # we need to dig into children to find the actual expert list.
         num_experts = 0
         expert_names: List[str] = []
+        # actual_expert_list: the real indexable container of expert modules
+        # (may differ from expert_list if expert_list is a wrapper)
+        actual_expert_list = expert_list
 
         if expert_list is not None:
             if isinstance(expert_list, nn.ModuleList):
@@ -166,33 +171,63 @@ def detect_moe_structure(model, model_name: str = "") -> MoEStructure:
                     f"{expert_list_attr}.{k}" for k in expert_list.keys()
                 ]
             elif isinstance(expert_list, nn.Module):
-                # Some implementations wrap experts in a custom Module;
-                # count its direct children as individual experts.
-                children = list(expert_list.children())
-                if children:
-                    num_experts = len(children)
-                    expert_names = [
-                        f"{expert_list_attr}.{i}" for i in range(num_experts)
-                    ]
+                # Custom wrapper module — dig into children to find the
+                # actual ModuleList of experts.
+                found_inner = False
+                for child_name, child in expert_list.named_children():
+                    if isinstance(child, nn.ModuleList) and len(child) > 1:
+                        # Found the real expert list inside the wrapper
+                        num_experts = len(child)
+                        actual_expert_list = child
+                        expert_names = [
+                            f"{expert_list_attr}.{child_name}.{i}"
+                            for i in range(num_experts)
+                        ]
+                        found_inner = True
+                        break
+
+                if not found_inner:
+                    # No inner ModuleList found; count direct children
+                    children = list(expert_list.children())
+                    if len(children) > 1:
+                        num_experts = len(children)
+                        expert_names = [
+                            f"{expert_list_attr}.{i}"
+                            for i in range(num_experts)
+                        ]
+                    # If only 1 child, don't count it as 1 expert — it's
+                    # likely a wrapper. Leave num_experts = 0 for config
+                    # fallback below.
+
             elif hasattr(expert_list, "__len__"):
                 num_experts = len(expert_list)
                 expert_names = [
                     f"{expert_list_attr}.{i}" for i in range(num_experts)
                 ]
 
-        if num_experts == 0:
-            # Fallback: try to infer num_experts from model config
-            model_config = getattr(model, "config", None)
-            if model_config is not None:
-                for cfg_attr in ("num_experts", "num_local_experts",
-                                 "n_experts", "moe_num_experts"):
-                    if hasattr(model_config, cfg_attr):
-                        num_experts = getattr(model_config, cfg_attr)
-                        expert_list_attr = expert_list_attr or "(from config)"
-                        expert_names = [
-                            f"expert.{i}" for i in range(num_experts)
-                        ]
-                        break
+        # Cross-check / fallback with model config
+        model_config = getattr(model, "config", None)
+        config_num_experts = 0
+        if model_config is not None:
+            for cfg_attr in ("num_experts", "num_local_experts",
+                             "n_experts", "moe_num_experts"):
+                if hasattr(model_config, cfg_attr):
+                    config_num_experts = int(getattr(model_config, cfg_attr))
+                    break
+
+        if num_experts == 0 and config_num_experts > 0:
+            # Detection failed but config knows the expert count
+            num_experts = config_num_experts
+            expert_list_attr = expert_list_attr or "(from config)"
+            expert_names = [f"expert.{i}" for i in range(num_experts)]
+        elif num_experts > 0 and config_num_experts > 0 and num_experts != config_num_experts:
+            # Mismatch: trust config over detection
+            print(
+                f"  [!] Layer {layer_idx}: detected {num_experts} experts "
+                f"but config says {config_num_experts}. Using config value."
+            )
+            num_experts = config_num_experts
+            expert_names = [f"{expert_list_attr}.{i}" for i in range(num_experts)]
 
         if num_experts == 0:
             # Debug: show what we found so the user can diagnose
@@ -326,6 +361,46 @@ def select_experts_by_score(
 # Dense Model Building
 # =============================================================================
 
+def _resolve_expert_list(expert_list) -> Optional[nn.ModuleList]:
+    """
+    Resolve the actual indexable expert container from various wrapper types.
+
+    Some models (e.g. OLMoE) wrap experts in a custom ``nn.Module`` whose
+    only child is the real ``nn.ModuleList``.  This function digs through
+    such wrappers and returns the ``ModuleList`` (or ``ModuleDict``) that
+    can be indexed by expert index.
+
+    Returns ``None`` if no usable expert container is found.
+    """
+    if expert_list is None:
+        return None
+
+    # Already a ModuleList — use directly
+    if isinstance(expert_list, nn.ModuleList):
+        return expert_list
+
+    # ModuleDict — convert to list for indexing
+    if isinstance(expert_list, nn.ModuleDict):
+        return nn.ModuleList(expert_list.values())
+
+    # Custom wrapper Module — look for a ModuleList child
+    if isinstance(expert_list, nn.Module):
+        # First pass: find a large ModuleList child (the expert list)
+        for _name, child in expert_list.named_children():
+            if isinstance(child, nn.ModuleList) and len(child) > 1:
+                return child
+
+        # Second pass: if no large ModuleList, collect all direct children
+        children = list(expert_list.children())
+        if len(children) > 1:
+            return nn.ModuleList(children)
+
+        # Single child that is itself a ModuleList
+        if len(children) == 1 and isinstance(children[0], nn.ModuleList):
+            return children[0]
+
+    return None
+
 class _DenseFFNWrapper(nn.Module):
     """
     A thin wrapper that makes a single expert FFN behave like a regular MLP
@@ -383,31 +458,22 @@ def build_dense_model(
         layer_selection = selected_experts.get(info.layer_idx, [(0, 0.0)])
         expert_idx, expert_score = layer_selection[0]
 
-        # Extract the expert module from various container types
+        # Resolve the actual indexable expert container.
+        # Some models (e.g. OLMoE) wrap experts in a custom nn.Module;
+        # we need to find the real ModuleList inside.
+        resolved_list = _resolve_expert_list(expert_list)
+
+        # Extract the expert module
         expert_module = None
 
-        if expert_list is not None:
-            if isinstance(expert_list, nn.ModuleList):
-                if expert_idx >= len(expert_list):
-                    print(
-                        f"  [!] Layer {info.layer_idx}: expert {expert_idx} "
-                        f"out of range (max {len(expert_list) - 1}), using 0"
-                    )
-                    expert_idx, expert_score = 0, 0.0
-                expert_module = expert_list[expert_idx]
-            elif isinstance(expert_list, nn.ModuleDict):
-                keys = list(expert_list.keys())
-                key = str(expert_idx) if str(expert_idx) in keys else keys[
-                    min(expert_idx, len(keys) - 1)
-                ]
-                expert_module = expert_list[key]
-            elif isinstance(expert_list, nn.Module):
-                children = list(expert_list.children())
-                if expert_idx >= len(children):
-                    expert_idx = 0
-                    expert_score = 0.0
-                if children:
-                    expert_module = children[expert_idx]
+        if resolved_list is not None and len(resolved_list) > 0:
+            if expert_idx >= len(resolved_list):
+                print(
+                    f"  [!] Layer {info.layer_idx}: expert {expert_idx} "
+                    f"out of range (max {len(resolved_list) - 1}), using 0"
+                )
+                expert_idx, expert_score = 0, 0.0
+            expert_module = resolved_list[expert_idx]
 
         if expert_module is None:
             print(
