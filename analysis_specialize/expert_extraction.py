@@ -361,43 +361,68 @@ def select_experts_by_score(
 # Dense Model Building
 # =============================================================================
 
-def _resolve_expert_list(expert_list) -> Optional[nn.ModuleList]:
+def _resolve_expert_list(source_module) -> Optional[nn.ModuleList]:
     """
-    Resolve the actual indexable expert container from various wrapper types.
+    Find the actual indexable expert ``nn.ModuleList`` from a MoE module.
 
-    Some models (e.g. OLMoE) wrap experts in a custom ``nn.Module`` whose
-    only child is the real ``nn.ModuleList``.  This function digs through
-    such wrappers and returns the ``ModuleList`` (or ``ModuleDict``) that
-    can be indexed by expert index.
+    Strategy (in order):
+    1. Check known attribute names (``experts``, ``local_experts``, etc.)
+    2. If the attribute is already a ``ModuleList`` → return it
+    3. If the attribute is a wrapper ``Module`` → dig into its children
+    4. Fall back to scanning **all** named children for the largest
+       ``ModuleList`` (works for any architecture)
 
-    Returns ``None`` if no usable expert container is found.
+    Args:
+        source_module: The MoE module (e.g. ``layer.mlp``) or an expert
+            list attribute.
+
+    Returns:
+        The ``nn.ModuleList`` of expert FFN modules, or ``None``.
     """
-    if expert_list is None:
+    if source_module is None:
         return None
 
     # Already a ModuleList — use directly
-    if isinstance(expert_list, nn.ModuleList):
-        return expert_list
+    if isinstance(source_module, nn.ModuleList):
+        return source_module if len(source_module) > 1 else None
 
-    # ModuleDict — convert to list for indexing
-    if isinstance(expert_list, nn.ModuleDict):
-        return nn.ModuleList(expert_list.values())
+    if not isinstance(source_module, nn.Module):
+        return None
 
-    # Custom wrapper Module — look for a ModuleList child
-    if isinstance(expert_list, nn.Module):
-        # First pass: find a large ModuleList child (the expert list)
-        for _name, child in expert_list.named_children():
-            if isinstance(child, nn.ModuleList) and len(child) > 1:
-                return child
+    # Strategy 1: try known attribute names on the module
+    for attr in _EXPERT_LIST_ATTRS:
+        child = getattr(source_module, attr, None)
+        if child is None:
+            continue
+        if isinstance(child, nn.ModuleList) and len(child) > 1:
+            return child
+        # Might be a wrapper Module containing the real ModuleList
+        if isinstance(child, nn.Module):
+            for _n, grandchild in child.named_children():
+                if isinstance(grandchild, nn.ModuleList) and len(grandchild) > 1:
+                    return grandchild
 
-        # Second pass: if no large ModuleList, collect all direct children
-        children = list(expert_list.children())
-        if len(children) > 1:
-            return nn.ModuleList(children)
+    # Strategy 2: scan ALL direct children for the largest ModuleList
+    best_list = None
+    best_len = 0
+    for _name, child in source_module.named_children():
+        if isinstance(child, nn.ModuleList) and len(child) > best_len:
+            best_list = child
+            best_len = len(child)
 
-        # Single child that is itself a ModuleList
-        if len(children) == 1 and isinstance(children[0], nn.ModuleList):
-            return children[0]
+    if best_list is not None and best_len > 1:
+        return best_list
+
+    # Strategy 3: recursive scan (one level deeper)
+    for _name, child in source_module.named_children():
+        if isinstance(child, nn.Module) and not isinstance(child, nn.ModuleList):
+            for _n2, grandchild in child.named_children():
+                if isinstance(grandchild, nn.ModuleList) and len(grandchild) > best_len:
+                    best_list = grandchild
+                    best_len = len(grandchild)
+
+    if best_list is not None and best_len > 1:
+        return best_list
 
     return None
 
@@ -452,34 +477,15 @@ def build_dense_model(
     for info in moe_structure.layers:
         layer = layers[info.layer_idx]
         moe_module = getattr(layer, info.moe_attr)
-        expert_list = getattr(moe_module, info.expert_list_attr, None)
 
         # Get the selected expert index for this layer
         layer_selection = selected_experts.get(info.layer_idx, [(0, 0.0)])
         expert_idx, expert_score = layer_selection[0]
 
-        # Resolve the actual indexable expert container.
-        # Some models (e.g. OLMoE) wrap experts in a custom nn.Module;
-        # we need to find the real ModuleList inside.
-        resolved_list = _resolve_expert_list(expert_list)
-
-        # Fallback: if expert_list_attr didn't work (e.g. was "(from config)"),
-        # search the moe_module itself for any ModuleList that looks like experts
-        if resolved_list is None:
-            resolved_list = _resolve_expert_list(moe_module)
-
-        # Second fallback: search ALL children of moe_module for a large
-        # ModuleList (the expert list)
-        if resolved_list is None:
-            for _name, child in moe_module.named_modules():
-                if isinstance(child, nn.ModuleList) and len(child) > 1:
-                    resolved_list = child
-                    if verbose:
-                        print(
-                            f"  [i] Layer {info.layer_idx}: found expert list "
-                            f"at moe.{_name} ({len(child)} experts)"
-                        )
-                    break
+        # Find the actual ModuleList of experts inside the MoE module.
+        # _resolve_expert_list handles all architectures: it searches known
+        # attribute names, scans direct children, and digs into wrappers.
+        resolved_list = _resolve_expert_list(moe_module)
 
         # Extract the expert module
         expert_module = None
