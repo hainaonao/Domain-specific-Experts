@@ -463,6 +463,24 @@ def build_dense_model(
         # we need to find the real ModuleList inside.
         resolved_list = _resolve_expert_list(expert_list)
 
+        # Fallback: if expert_list_attr didn't work (e.g. was "(from config)"),
+        # search the moe_module itself for any ModuleList that looks like experts
+        if resolved_list is None:
+            resolved_list = _resolve_expert_list(moe_module)
+
+        # Second fallback: search ALL children of moe_module for a large
+        # ModuleList (the expert list)
+        if resolved_list is None:
+            for _name, child in moe_module.named_modules():
+                if isinstance(child, nn.ModuleList) and len(child) > 1:
+                    resolved_list = child
+                    if verbose:
+                        print(
+                            f"  [i] Layer {info.layer_idx}: found expert list "
+                            f"at moe.{_name} ({len(child)} experts)"
+                        )
+                    break
+
         # Extract the expert module
         expert_module = None
 
@@ -476,9 +494,15 @@ def build_dense_model(
             expert_module = resolved_list[expert_idx]
 
         if expert_module is None:
+            # Debug: show what's inside moe_module to help diagnose
+            children_info = [
+                f"{n}({type(c).__name__})"
+                for n, c in moe_module.named_children()
+            ]
             print(
                 f"  [!] Layer {info.layer_idx}: could not extract expert "
-                f"{expert_idx}, skipping"
+                f"{expert_idx}. expert_list_attr={info.expert_list_attr!r}, "
+                f"moe children: {children_info}"
             )
             continue
 
