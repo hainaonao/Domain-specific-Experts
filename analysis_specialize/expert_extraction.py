@@ -439,10 +439,101 @@ class _DenseFFNWrapper(nn.Module):
         self.expert = expert_module
 
     def forward(self, hidden_states, **kwargs):
-        # Expert FFN: hidden_states → hidden_states
-        # Some MoE implementations pass extra kwargs (e.g. padding_mask);
-        # we just call the expert with hidden_states.
         return self.expert(hidden_states)
+
+
+class _FusedExpertFFN(nn.Module):
+    """
+    A standalone FFN extracted from a fused expert module.
+
+    Fused experts (e.g. OlmoeExperts) store all expert weights in stacked 3D
+    tensors like ``gate_up_proj[num_experts, ...]``.  This class holds the
+    sliced weights for a single expert and performs the SwiGLU forward pass.
+    """
+
+    def __init__(self, gate_proj_weight, up_proj_weight, down_proj_weight,
+                 act_fn=None):
+        super().__init__()
+        self.gate_proj = nn.Linear(
+            gate_proj_weight.shape[1], gate_proj_weight.shape[0], bias=False
+        )
+        self.up_proj = nn.Linear(
+            up_proj_weight.shape[1], up_proj_weight.shape[0], bias=False
+        )
+        self.down_proj = nn.Linear(
+            down_proj_weight.shape[1], down_proj_weight.shape[0], bias=False
+        )
+        self.gate_proj.weight = nn.Parameter(gate_proj_weight.clone())
+        self.up_proj.weight = nn.Parameter(up_proj_weight.clone())
+        self.down_proj.weight = nn.Parameter(down_proj_weight.clone())
+        self.act_fn = act_fn or nn.SiLU()
+
+    def forward(self, hidden_states, **kwargs):
+        return self.down_proj(
+            self.act_fn(self.gate_proj(hidden_states))
+            * self.up_proj(hidden_states)
+        )
+
+
+def _get_expert_weight(module, attr_name, expert_idx):
+    """Get weight for a specific expert from a 3D parameter or Linear."""
+    param = getattr(module, attr_name, None)
+    if param is None:
+        return None
+    if isinstance(param, (nn.Parameter, torch.Tensor)):
+        if param.dim() == 3 and expert_idx < param.shape[0]:
+            return param[expert_idx].detach()
+    if isinstance(param, nn.Linear):
+        w = param.weight
+        if w.dim() == 3 and expert_idx < w.shape[0]:
+            return w[expert_idx].detach()
+    return None
+
+
+def _extract_expert_from_fused(fused_module, expert_idx, num_experts):
+    """
+    Extract a single expert from a fused expert module.
+
+    Handles patterns:
+    1. Separate gate_proj, up_proj, down_proj (3D)
+    2. Combined gate_up_proj + down_proj
+    3. Any 3D parameters with dim0 == num_experts
+    """
+    # Pattern 1: separate projections
+    gate_w = _get_expert_weight(fused_module, "gate_proj", expert_idx)
+    up_w = _get_expert_weight(fused_module, "up_proj", expert_idx)
+    down_w = _get_expert_weight(fused_module, "down_proj", expert_idx)
+
+    if gate_w is not None and up_w is not None and down_w is not None:
+        return _FusedExpertFFN(gate_w, up_w, down_w)
+
+    # Pattern 2: combined gate_up_proj
+    gate_up_w = _get_expert_weight(fused_module, "gate_up_proj", expert_idx)
+    down_w = down_w or _get_expert_weight(fused_module, "down_proj", expert_idx)
+
+    if gate_up_w is not None and down_w is not None:
+        mid = gate_up_w.shape[0] // 2
+        return _FusedExpertFFN(gate_up_w[:mid], gate_up_w[mid:], down_w)
+
+    # Pattern 3: scan all 3D parameters with dim0 == num_experts
+    param_3d = {}
+    for name, param in fused_module.named_parameters(recurse=False):
+        if param.dim() == 3 and param.shape[0] == num_experts:
+            param_3d[name] = param[expert_idx].detach()
+
+    if len(param_3d) >= 2:
+        sorted_params = sorted(param_3d.items())
+        if len(sorted_params) == 2:
+            combined_w = sorted_params[0][1]
+            d_w = sorted_params[1][1]
+            mid = combined_w.shape[0] // 2
+            return _FusedExpertFFN(combined_w[:mid], combined_w[mid:], d_w)
+        elif len(sorted_params) >= 3:
+            return _FusedExpertFFN(
+                sorted_params[0][1], sorted_params[1][1], sorted_params[2][1]
+            )
+
+    return None
 
 
 def build_dense_model(
@@ -482,12 +573,8 @@ def build_dense_model(
         layer_selection = selected_experts.get(info.layer_idx, [(0, 0.0)])
         expert_idx, expert_score = layer_selection[0]
 
-        # Find the actual ModuleList of experts inside the MoE module.
-        # _resolve_expert_list handles all architectures: it searches known
-        # attribute names, scans direct children, and digs into wrappers.
+        # ---- Approach 1: ModuleList-based experts ----
         resolved_list = _resolve_expert_list(moe_module)
-
-        # Extract the expert module
         expert_module = None
 
         if resolved_list is not None and len(resolved_list) > 0:
@@ -499,17 +586,42 @@ def build_dense_model(
                 expert_idx, expert_score = 0, 0.0
             expert_module = resolved_list[expert_idx]
 
+        # ---- Approach 2: Fused expert module (e.g. OlmoeExperts) ----
         if expert_module is None:
-            # Debug: show what's inside moe_module to help diagnose
+            for attr in _EXPERT_LIST_ATTRS:
+                candidate = getattr(moe_module, attr, None)
+                if (candidate is not None
+                        and isinstance(candidate, nn.Module)
+                        and not isinstance(candidate, nn.ModuleList)):
+                    expert_module = _extract_expert_from_fused(
+                        candidate, expert_idx, info.num_experts
+                    )
+                    if expert_module is not None:
+                        if verbose:
+                            print(
+                                f"  [i] Layer {info.layer_idx}: extracted "
+                                f"expert {expert_idx} from fused "
+                                f"{type(candidate).__name__}"
+                            )
+                        break
+
+        if expert_module is None:
             children_info = [
                 f"{n}({type(c).__name__})"
                 for n, c in moe_module.named_children()
             ]
             print(
                 f"  [!] Layer {info.layer_idx}: could not extract expert "
-                f"{expert_idx}. expert_list_attr={info.expert_list_attr!r}, "
-                f"moe children: {children_info}"
+                f"{expert_idx}. moe children: {children_info}"
             )
+            for attr in _EXPERT_LIST_ATTRS:
+                candidate = getattr(moe_module, attr, None)
+                if candidate is not None and isinstance(candidate, nn.Module):
+                    params = [
+                        f"{n}: {list(p.shape)}"
+                        for n, p in candidate.named_parameters(recurse=False)
+                    ]
+                    print(f"      {attr} params: {params[:6]}")
             continue
 
         # Create dense wrapper
